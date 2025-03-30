@@ -1,2 +1,2 @@
 # Bayesian-randomized-basket-trial-design
-A case study from the ultra-rare invasive mould infections
+scripts for 'Bayesian randomized basket trial design: a case study from the ultra-rare invasive mould infections'
