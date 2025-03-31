@@ -12,15 +12,9 @@ Invasive mould infections (IMIs) are rare but life-threatening. Regulatory appro
 # Code Overview
 
 ### Paper.code:
---trial of invasive mould infections.R: main scripts for sourcing functions to implement BMA, BMA-2D, EXNEX and EXNEX-2D methods and simulation setting set up  
-
 --reg_bma.R/myfun.R/mem functions.R: scripts for implmenting BMA and BMA-2D methods  
 
 --exnex.R/exnex utility.R: scripts for implementing EXNEX and EXNEX-2D methods  
-
---trial simulations.R: scripts of running simulations  
-
---figures.R: scripts for having plots for simulation and sensitivity analysis  
 
 --Re_Analysis of IMI Trial.Rmd: scripts for re_analysis of IMI trial used in Case Study
 
