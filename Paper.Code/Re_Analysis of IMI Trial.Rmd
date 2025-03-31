@@ -28,7 +28,7 @@ library(mvtnorm)
 ##Source fundtions used in case study
 ```{r}
 setwd("/Users/iad/Desktop/Study/Yale/Research/Wei Wei Project TDB /code")
-source("reg_bma_2.R")
+source("reg_bma.R")
 source("myfun.R")
 source("mem functions.R")
 source("exnex.R")
