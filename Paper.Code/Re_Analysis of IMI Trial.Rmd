@@ -1,0 +1,708 @@
+---
+title: "Re_Analysis of IMI Trial"
+author: "Yunhe Liu"
+date: "2024-10-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+###  Implementation
+This section provides R implementation of the model described above.
+The required R packages are:
+```{r}
+#rm(list=ls(all=TRUE))
+library(RBesT)
+library(randomizr)
+library(reshape2)
+library(GGally)
+library(foreach)
+require(LearnBayes)
+library(mvtnorm)
+```
+
+
+##Source fundtions used in case study
+```{r}
+setwd("/Users/iad/Desktop/Study/Yale/Research/Wei Wei Project TDB /code")
+source("reg_bma_2.R")
+source("myfun.R")
+source("mem functions.R")
+source("exnex.R")
+```
+
+
+##Change some functions better used in case study estimates
+```{r}
+## b0_prior: (mean, sd, weight of this component)
+## b1_prior: (mean, sd)
+## pess_prior: pess prior for each indication
+## enth_prior: enth prior for each indication
+## mod_prior: prior weight for each model of consideration
+
+## set up all the models: 
+## B: number of indications
+init.mod <- function(B, prior_indicator){
+  zero_one <- list()
+  #1 is promising, 0 is not promising
+  for(b in 1:B) zero_one[[b]] <- prior_indicator
+  mods <- expand.grid(zero_one)
+  names(mods) <- LETTERS[1:B]
+  mods
+}
+
+gen.prior <- function(mods, r){
+  B <- ncol(mods)
+  tab0 <- rbind(table(rowSums(mods==1)), (1+0:B)^r/sum((1+0:B)^r))
+  prior <- tab0[2, 1+rowSums(mods==1)]/tab0[1, 1+rowSums(mods==1)]
+  
+  sim_mat <- diag(1, B, B)
+  for(i in 1:B){
+    for(j in 1:B){
+      if(i==j){sim_mat[i, j] <- 1}
+      if(i!=j){
+        sim_mat[i, j] <- sim_mat[j, i] <- sum((mods[, i]*mods[, j]==1)*prior)
+      }
+    }
+  }
+  rownames(sim_mat) <- colnames(sim_mat) <- paste("IND", 1:B, sep="")
+  
+  list("tab" = tab0, "prior"=prior, "sim" = sim_mat)
+}
+
+post.den <- function(betas, b0_prior, b1_prior, x, y, log = T){
+  b0 <- betas[1]
+  b1 <- betas[2]
+  lik <- prod(ifelse( y==1, exp(b0+b1*x)/(1+exp(b0+b1*x)), 
+                      1/(1+exp(b0+b1*x)) ))
+  ##prior density of intercept b0
+  den0 <- b0_prior[3]*dnorm(b0, b0_prior[1], b0_prior[2])+
+    (1-b0_prior[3])*dnorm(b0, 0, 100)
+  ##prior density of slope b1
+  den1 <- dnorm(b1, b1_prior[1], b1_prior[2])
+  post <- lik*den0*den1
+  if(log){
+    log(post)
+  }else{
+    post
+  }
+}
+
+## y: response to treatment
+## x: treatment assignment
+
+mlik <- function(y, x, b0_prior, b1_prior, approxi = TRUE){
+  if(approxi){
+    inits <- c(as.numeric(glm(y ~ 1, family = binomial)$coef), 0)
+    logmp <- laplace(post.den, inits, b0_prior = b0_prior, b1_prior = b1_prior,
+                     y = y, x = x)$int
+    exp(logmp)
+  }else{
+    adaptIntegrate(post.den, b0_prior = b0_prior, b1_prior = b1_prior,
+                   y = y, x = x, log = FALSE, 
+                   lowerLimit=c(-100,-100),
+                   upperLimit=c(100, 100))$integral
+  }
+}
+
+update.mod.wt <- function(dat, b0_prior_mat, pess_prior, enth_prior, mod_prior, 
+                          approxi = TRUE){
+  B <- ncol(pess_prior)
+  ## list all the models to average
+  ## rows are models, columns are indications
+  mods <- init.mod(B, prior_indicator = c(0, 1))
+  ## marginal likelihood of each indication under 
+  ## pessimisitc and enthusiastic priors
+  mar_lik <- matrix(NA, nrow = 2, ncol = B)
+  rownames(mar_lik) <- c("pess", "enth")
+  
+  for(b in 1:B){
+    y <- dat[[b]]$outcome
+    x <- dat[[b]]$trt
+    
+    if(approxi==FALSE){
+      mar_lik[1, b] <- mlik(y = y, x = x, b0_prior = b0_prior_mat[b, ], 
+                            b1_prior = pess_prior[, b], approxi = FALSE)
+      
+      mar_lik[2, b] <- mlik(y = y, x = x, b0_prior = b0_prior_mat[b, ], 
+                            b1_prior = enth_prior[, b], approxi = FALSE)
+    }
+    if(approxi){
+      mar_lik[1, b] <- mlik(y = y, x = x, b0_prior = b0_prior_mat[b, ], 
+                            b1_prior = pess_prior[, b])
+      
+      mar_lik[2, b] <- mlik(y = y, x = x, b0_prior = b0_prior_mat[b, ], 
+                            b1_prior = enth_prior[, b])
+    }
+  }
+  
+  p <- NULL
+  for(k in 1:nrow(mods)){
+    idx0 <- (mods[k, ]==0)
+    idx1 <- (mods[k, ]==1)
+    p[k] <- prod(ifelse(mods[k, ]==0, mar_lik[1, ], mar_lik[2, ]))*mod_prior[k]
+  }
+  ## calculate posterior prob of each grouping structure
+  mods$p <- p/sum(p)
+  
+  list("mlik" = mar_lik, "mods" = mods)
+}
+
+fit.bma <- function(dat, b0_prior_mat, pess_prior, enth_prior, mod_prior, 
+                    post_enth_wt, approxi = TRUE, beta_ni = NULL){
+  result <- NULL
+  for(b in 1:ncol(pess_prior)){
+    y <- dat[[b]]$outcome
+    x <- dat[[b]]$trt
+    
+    inits <- c(as.numeric(glm(y ~ 1, family = binomial)$coef), 0)
+    
+    post_fit0 <- laplace(post.den, inits, b0_prior = b0_prior_mat[b, ], 
+                         b1_prior = pess_prior[, b], y = y, x = x)
+    post_sim0 <- rmvnorm(5000, mean = post_fit0$mode, sigma = post_fit0$var)
+    
+    post_fit1 <- laplace(post.den, inits, b0_prior = b0_prior_mat[b, ], 
+                         b1_prior = enth_prior[, b], y = y, x = x)
+    post_sim1 <- rmvnorm(5000, mean = post_fit1$mode, sigma = post_fit1$var)
+    ## the mixture of two models
+    mod_ind <- rbinom(n = 5000, size = 1, prob = post_enth_wt[b])
+    post_sim <- rbind(post_sim1[mod_ind==1, ], post_sim0[mod_ind==0, ])
+    est <- quantile(post_sim[, 2], c(0.025, 0.5, 0.975))
+    
+    #Calculate estimated mortality rate
+    logit_trt <- as.vector(post_sim[, 1]+post_sim[, 2])
+    Diff      <- exp(logit_trt)/(1+exp(logit_trt)) - exp(post_sim[, 1])/(1+exp(post_sim[, 1]))
+    est_diff  <- mean(Diff)
+    qua_diff  <- quantile(Diff, c(0.025, 0.5, 0.975))
+    
+    if(is.null(beta_ni)){
+      pp <- mean(post_sim[, 2]<0)
+    }else{
+      pp <- mean(post_sim[, 2]<beta_ni)
+    }
+    
+    result <- rbind(result, c(qua_diff, pp, est_diff))
+  }
+  result <- data.frame(result)
+  names(result) <- c("q2.5", "q50", "q97.5", "pp", "bias")
+  result
+}
+```
+
+
+### Example
+Invasive mould infections (IMIs), such as invasive aspergillosis or mucormycosis, are a major cause of death in patients with hematological cancer and in patients receiving long-term immunosuppressive therapy. People, especially those with weakened immune systems, can develop invasive mold infections days to weeks after exposure to fungi that live in the environment. These infections are rare, difficult to diagnose and often life-threatening. Antifungal clinical trials have always been difficult to recruit patients due to the relatively small number patients with the specific invasive fungal infection (~ 1.5/site/year). The trials are logistically complex, take a long time to conduct and are require much resources (people and money). FDA has issued the limited population pathway for antibacterial and antifungal drugs (LPAD pathway) guidance document, for drugs intended to treat a serious or life-threatening infection in a limited population of patients with unmet needs and permits the risk-benefit assessment to flexibly consider severity, rarity, and prevalence of infection the drug is intended to treat, however LPAD pathway does not alter FDA approval standards which requires randomized comparison. The common practice is to perform analysis combining all fungal pathogens. 
+
+We analyze a hypothetical trial data where participants were be randomized in a 2:1 ratio to an experimental treatment or standard of care (SOC) based on the confirmed or suspected fungal species. The primary endpoint was day 42 survival rate. Improvement in day 42 survival rate indicates efficacy of experimental treatment. 
+```{r}
+## simulate data for a randomized basket trial
+sim.dat <- function(n_soc, n_trt, p_soc, p_trt){
+  ## sample size of each indication
+  ind_size <- n_soc + n_trt
+  ## number of indications
+  B <- length(p_soc)
+  ## response rate (trt*indication)
+  pmat <- rbind(p_soc, p_trt)
+  ## sample size (trt*indication)
+  rownames(pmat) <- c("soc", "trt")
+  colnames(pmat) <- paste("IND-", LETTERS[1:B], sep = "")
+  
+  rawdat <- list()
+  ## aggregated data
+  y_soc <- y_trt <- NULL
+  for(b in 1:B){
+    ## randomize within each indication
+    trt <- complete_ra(N = ind_size[b],  m = n_trt[b])
+    ## response probability of each patient in indication b
+    pvec <- pmat[1+trt, b]
+    outcome <- rbinom(n = ind_size[b], size = 1, prob = pvec)
+    rawdat[[b]] <- data.frame("trt"=trt, "outcome"=outcome)
+    y_trt[b] <- sum(outcome[trt==1])
+    y_soc[b] <- sum(outcome[trt==0])
+  }
+  
+  summary_data <- data.frame(n_soc = n_soc, n_trt = n_trt, 
+                             y_soc = y_soc, y_trt = y_trt)
+  
+  list("raw_data" = rawdat, "summary_data" = summary_data)
+}
+
+
+# Determines amount of prior enthusiasm we have for the experimental treatments 
+r <- 0
+# Noninferiority margin
+ni_mar <- 0.05
+## ----------------------------------------------------------------
+## current trial:
+## Participants will be randomized in a 2:1 ratio to an 
+## experimental treatment or standard of care (SOC) based on 
+## the confirmed or suspected fungal species. Below are the 
+## details of comparator and sample size for each pathogen. 
+##Fungal Pathogen	SOC	N (Trt/Control)
+## Fusarium	L-AmB +/- VORI	20/10
+## Scedosporium	VORI +/- other AF	15/7
+## Lomentospora	VORI + TERB  (+/- other AF)	15/7
+## Aspergillus	L-AmB +/-CAN	30/15
+## Mucorales	L-AmB +/- other AF or ISA monoRx	20/10
+## ----------------------------------------------------------------
+# randomization ratio of trt vs. ctr
+R <- 2
+ind_name <- c("Fusarium", "Scedosporium", "Lomentospora", "Aspergillus", 
+              "Mucorales")
+# below are the assumed true death rates we simulate from:
+# day42 death rates for SOC
+p0 <- c(0.60, 0.88, 0.70, 0.51, 0.67)
+# day42 death rates for the treatment:
+p1 <- p0 - 0.30
+## ----------------------------------------------------------------
+# B: the number of indications 
+B <- length(p0)
+# ind_size: the total sample size of each indication
+ind_size <- c(30, 22, 22, 45, 30)
+n_soc <- c(10, 7, 7, 15, 10)
+n_trt <- c(20, 15, 15, 30, 20)
+## ----------------------------------------------------------------
+## historical control:
+## ----------------------------------------------------------------
+## sample size of relevant historical controls:
+nh <- c(112, 89, 20, 37, 21)
+## number of day42 deaths in historical controls
+rh <- c(66, 78, 14, 19, 14)
+## ----------------------------------------------------------------
+## set up the simulation study
+## ----------------------------------------------------------------
+# pmat0/pmat1: matrix of response rates for the SOC/trt 
+## rows: scenarios
+## columns: indications
+pmat0 <- matrix(rep(c(0.6, 0.88, 0.7, 0.51, 0.67), 6), nrow = 6, byrow = TRUE)
+# pmat1 <- matrix(c(0.65, 0.30, 0.30, 0.30, 0.30, 0.30,
+#                   0.93, 0.93, 0.58, 0.58, 0.58, 0.58,
+#                   0.75, 0.75, 0.75, 0.40, 0.40, 0.40,
+#                   0.56, 0.56, 0.56, 0.56, 0.21, 0.21,
+#                   0.72, 0.72, 0.72, 0.72, 0.72, 0.37),
+#                   nrow = 6, byrow = FALSE)
+pmat1 <- matrix(c(0.65, 0.45, 0.45, 0.45, 0.45, 0.45,
+                  0.93, 0.93, 0.73, 0.73, 0.73, 0.73,
+                  0.75, 0.75, 0.75, 0.55, 0.55, 0.55,
+                  0.56, 0.56, 0.56, 0.56, 0.36, 0.36,
+                  0.72, 0.72, 0.72, 0.72, 0.72, 0.52),
+                  nrow = 6, byrow = FALSE)
+```
+
+
+Here, we consider five scenarios in our data generation and we take the scenario
+3 as illustration. Scenario 1 is the global null scenario, the D42-mortality rate 
+is 0.65, 0.93, 0.75, 0.56 and 0.72 for the the treatment and control arms of 
+each indication. Under scenarios 2, · · · , 5, the experimental treatment succeeds 
+in some indications (reaching the target mortality rate) but fails in other 
+indications. 
+
+
+```{r}
+Case.Study <- function(trial_dat){
+  ##Test Decision: Posterior Probability Threshold
+  gam_ref   <- rep(0.9832, 5)
+  gam_bma   <- rep(0.9806, 5)
+  gam_bma2D <- rep(0.9618, 5)
+  gam_nex   <- rep(0.9754, 5)
+  gam_nex2D <- rep(0.9706, 5)
+
+
+  ## ----------------------------------------------------
+  ## Reference method without any borrowing
+  ## ----------------------------------------------------
+  trial_summary <- sim_out$summary_data
+  trial_summary$Disease <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                            "Aspergillus", "Mucorales")
+  # Test Decision
+  ref.pp <- 1 - no.borrow(trial_summary, ni_mar = ni_mar)
+  decision.ref  <- ref.pp > gam_ref
+  #Calculate mortality rate difference (treatment effect) est
+  phat0 <- (sim_out$summary_data$y_soc + 1) / (sim_out$summary_data$n_soc + 2)
+  phat1 <- (sim_out$summary_data$y_trt + 1) / (sim_out$summary_data$n_trt + 2)
+  est.ref <- (phat1 - phat0)
+  #Calculate mortality rate difference 95% credible interval
+  samples.phat0 <- matrix(0, nrow = 5000, ncol = length(pmat1[s,]))
+  samples.phat1 <- matrix(0, nrow = 5000, ncol = length(pmat1[s,]))
+  for (i in 1:length(pmat1[s,])) {
+    samples.phat0[, i] <- rbeta(5000,sim_out$summary_data$y_soc[i] + 1,
+                          (sim_out$summary_data$n_soc[i] - sim_out$summary_data$y_soc[i]) + 1)
+  }
+  for (j in 1:length(pmat1[s,])) {
+    samples.phat1[, j] <- rbeta(5000, sim_out$summary_data$y_trt[j] + 1,
+                          (sim_out$summary_data$n_trt[j] - sim_out$summary_data$y_trt[j]) + 1)
+  }
+  samples.diff   <- samples.phat1 - samples.phat0
+  credible.ref   <- apply(samples.diff, 2, function(column) quantile(column, c(0.025, 0.975)))
+  
+  
+  ## ----------------------------------------------------
+  ## naive pooling
+  ## ----------------------------------------------------
+  pooled <- colSums(sim_out$summary_data)
+  phat0 <- pooled[3] / pooled[1]
+  phat1 <- pooled[4] / pooled[2]
+  se <- sqrt(phat0 * (1 - phat0) / pooled[1] + phat1 * (1 - phat1) / pooled[2])
+  zval.pool <- (phat1 - phat0 - ni_mar) / se
+  # Test Decision
+  decision.pool <- rep(zval.pool < qnorm(0.1), 5)
+  names(decision.pool) <- NULL
+  pvalue.pool <-  pnorm(unique(zval.pool))
+  #Calculate mortality rate difference (treatment effect) est
+  est.pool <- as.numeric(phat1 - phat0)
+  #Calculate mortality rate difference 95% confidence interval
+  alpha <- 0.05
+  z_alpha_2  <- qnorm(1 - alpha / 2)
+  se <- as.numeric(sqrt(phat0*(1-phat0)/pooled[1] + phat1*(1-phat1)/pooled[2]))
+  pool.lower <- rep(as.numeric(phat1 - phat0), 5) - rep(z_alpha_2 * se, 5)
+  pool.upper <- rep(as.numeric(phat1 - phat0), 5) + rep(z_alpha_2 * se, 5)
+  confidence.pool <- rbind(pool.lower, pool.upper)
+  rownames(confidence.pool) <- c("2.5%", "97.5")
+  
+  
+  ## ----------------------------------------------------
+  ## Test&Pool
+  ## ----------------------------------------------------
+  pooled <- colSums(sim_out$summary_data)
+  phat0 <- pooled[3] / pooled[1]
+  phat1 <- pooled[4] / pooled[2]
+  se <- sqrt(phat0 * (1 - phat0) / pooled[1] + phat1 * (1 - phat1) / pooled[2])
+  zval.test.pool<- (phat1 - phat0 - ni_mar) / se
+  # Test Decision
+  decision.test.pool <- rep(zval.test.pool< qnorm(0.1), 5)
+  names(decision.test.pool) <- NULL
+  pvalue.test.pool <-  pnorm(unique(zval.test.pool))
+  #Calculate mortality rate difference (treatment effect) est
+  est.test.pool <- as.numeric(phat1 - phat0)
+  #Calculate mortality rate difference 95% confidence interval
+  alpha <- 0.05
+  z_alpha_2  <- qnorm(1 - alpha / 2)
+  se <- as.numeric(sqrt(phat0*(1-phat0)/pooled[1] + phat1*(1-phat1)/pooled[2]))
+  test.pool.lower <- rep(as.numeric(phat1-phat0), 5) - rep(z_alpha_2*se, 5)
+  test.pool.upper <- rep(as.numeric(phat1-phat0), 5) + rep(z_alpha_2*se, 5)
+  confidence.test.pool <- rbind(test.pool.lower, test.pool.upper)
+  rownames(confidence.test.pool) <- c("2.5%", "97.5")
+  ## ----------------------------------------------------
+  ## if pooled result is significant, then proceed with individual tests:
+  ## ----------------------------------------------------
+  pval <- pnorm(unique(zval.test.pool))
+  if (pval < 0.1) {
+    phat0 <- sim_out$summary_data$y_soc / sim_out$summary_data$n_soc
+    phat1 <- sim_out$summary_data$y_trt / sim_out$summary_data$n_trt
+    se <- sqrt(phat0*(1-phat0)/sim_out$summary_data$n_soc + phat1*(1-phat1)/sim_out$summary_data$n_trt)
+    zval.test.pool<- (phat1 - phat0 - ni_mar) / se
+    # Test Decision
+    decision.test.pool <- zval.test.pool< qnorm(0.1/5)
+    names(decision.test.pool) <- NULL
+    pvalue.test.pool <-  pnorm(zval.test.pool)
+    #Calculate mortality rate difference (treatment effect) est
+    est.test.pool <- as.numeric(phat1 - phat0)
+    #Calculate mortality rate difference 95% credible
+    alpha <- 0.05
+    z_alpha_2  <- qnorm(1 - alpha / 2)
+    test.pool.lower <- as.numeric(phat1 - phat0) - z_alpha_2 * se
+    test.pool.upper <- as.numeric(phat1 - phat0) + z_alpha_2 * se
+    confidence.test.pool <- rbind(test.pool.lower, test.pool.upper)
+    rownames(confidence.test.pool) <- c("2.5%", "97.5")
+  }
+  
+  
+  ## ----------------------------------------------------------------
+  # B: the number of indications
+  B <- length(p0)
+  ## ----------------------------------------------------------------
+  ## historical control:
+  ## ----------------------------------------------------------------
+  ph <- rh / nh
+  ## unit information of the log odds for SOC
+  u <- ph * (1 - ph)
+  ## sd of the prior for log odds
+  sd0 <- sqrt((u * n_soc) ^ (-1))
+  m0 <- log(ph / (1 - ph))
+  
+  ## ----------------------------------------------------------------
+  ## enthusiastic and pessimistic priors:
+  ## design priors represent the state of knowledge about
+  ## SOC or treatment, they should not overlap too much
+  ## the selection of design priors can be informed by historical trials or
+  ## based on expert opinions. If there are multiple historical trials,
+  ## map can be used.
+  ## previous trials and external data might not have the biomarkers needed
+  ## ----------------------------------------------
+  pess_prior <- enth_prior <- matrix(NA, nrow = 2, ncol = length(p1))
+  for (b in 1:B) {
+    n11 <- ind_size[b] * (R / (R + 1)) * p1[b]
+    n10 <- ind_size[b] * (R / (R + 1)) * (1 - p1[b])
+    n01 <- ind_size[b] * (1 / (R + 1)) * (p0[b])
+    n00 <- ind_size[b] * (1 / (R + 1)) * (1 - p0[b])
+    v <- sum(c(n11, n10, n01, n00) ^ (-1))
+    #pess_prior[, b] <- c(0, sqrt(v))
+    #assume it is worse
+    pess_prior[, b] <- c(logit(p0[b] + ni_mar) - logit(p0[b]), sqrt(v))
+    enth_prior[, b] <- c(logit(p1[b]) - logit(p0[b]), sqrt(v))
+  }
+  ## ----------------------------------------------------------------
+  ## select the method for BMA
+  ## ----------------------------------------------------------------
+  bma_mods <- init.mod(B, prior_indicator = c(0, 1))
+  bma_prior <- gen.prior(mods = bma_mods, r = r)$prior
+  ## ----------------------------------------------------
+  ## BMA: learning across indications
+  ## ----------------------------------------------------
+  b0_prior_mat <- cbind(rep(0, B), rep(5, B), 1)
+  
+  post_mod_wt <- update.mod.wt(dat = trial_dat, b0_prior_mat = b0_prior_mat, pess_prior = pess_prior,
+                               enth_prior = enth_prior, mod_prior = bma_prior)$mods
+  
+  post_enth_wt <- colSums(post_mod_wt[, 1:B] * post_mod_wt$p)
+  
+  beta_ni <- log((p0 + ni_mar) / (1 - (p0 + ni_mar))) - log(p0 / (1 - p0))
+  
+  fit <-fit.bma(dat = trial_dat, b0_prior_mat = b0_prior_mat, pess_prior = pess_prior,
+                enth_prior = enth_prior, mod_prior = bma_prior, 
+                post_enth_wt = post_enth_wt, beta_ni = beta_ni)
+  # Test Decision
+  bma.pp <- fit$pp
+  decision.bma <- bma.pp > gam_bma
+  names(decision.bma) <- NULL
+  #Calculate mortality rate difference (treatment effect) est
+  est.bma <- fit$bias
+  #Calculate mortality rate difference 95% credible interval
+  bma.lower <- fit$q2.5
+  bma.upper <- fit$q97.5
+  credible.bma <- rbind(bma.lower, bma.upper)
+  rownames(credible.bma) <- c("2.5%", "97.5")
+  
+  
+  ## ----------------------------------------------------
+  ## BMA two dimensional learning
+  ## ----------------------------------------------------
+  b0_prior_mat <- cbind(m0, sd0, 0.5)
+  
+  post_mod_wt <- update.mod.wt(dat = trial_dat, b0_prior_mat = b0_prior_mat, pess_prior = pess_prior,
+                               enth_prior = enth_prior, mod_prior = bma_prior)$mods
+  
+  post_enth_wt <- colSums(post_mod_wt[, 1:B] * post_mod_wt$p)
+  
+  fit <- fit.bma(dat = trial_dat, b0_prior_mat = b0_prior_mat, pess_prior = pess_prior,
+                 enth_prior = enth_prior, mod_prior = bma_prior,
+                 post_enth_wt = post_enth_wt, beta_ni = beta_ni)
+  # Test Decision
+  bma.2D.pp <- fit$pp
+  decision.bma.2D <- bma.2D.pp > gam_bma2D
+  #Calculate mortality rate difference (treatment effect) est
+  est.bma.2D <- fit$bias
+  #Calculate mortality rate difference 95% credible interval
+  bma.2D.lower <- fit$q2.5
+  bma.2D.upper <- fit$q97.5
+  credible.bma.2D <- rbind(bma.2D.lower, bma.2D.upper)
+  rownames(credible.bma.2D) <- c("2.5%", "97.5")
+  
+  
+  ## prior ess for borrowing from historical trial
+  prior_n <- n_soc
+  # Informative prior for the control arm using exnex
+  infor_prior_ab <- cbind(prior_n * rh / nh, prior_n * (nh - rh) / nh)
+  ## ----------------------------------------------------
+  ## EXNEX
+  ## ----------------------------------------------------
+  trial_summary$x_soc <- trial_summary$n_soc - trial_summary$y_soc
+  
+  nex_anal <- Model_EXEX_rand (
+    y.t = trial_summary$y_trt,
+    n.t = trial_summary$n_trt,
+    group       = 1:B,
+    group.nm    = trial_summary$Disease,
+    Prior.mu.t  = c(log(4), 1),
+    Prior.tau.t = c(0, 0.5),
+    p.exch.t    = 0.5,
+    tau.index   = 1,
+    Prior.nex.t = cbind(rep(0, B), rep(2, B)),
+    pars = c("p.t", "tau.t", "Z.t"),
+    MCMC = c(5000, 10000, 1, 1),
+    DIC = TRUE,
+    seed = 19978
+  )
+  
+  pt_mcmc <- nex_anal$sim$p.t
+  
+  pc_mcmc <- NULL
+  for (basket in 1:B) {
+    pc_mcmc <-
+      cbind(pc_mcmc,
+            rbeta(5000, 1 + trial_summary$y_soc[basket], 1 + trial_summary$x_soc[basket]))
+  }
+  # Test Decision
+  nex.pp <- colMeans(pt_mcmc < pc_mcmc + ni_mar)
+  decision.nex <- nex.pp > gam_nex
+  names(decision.nex) <- NULL
+  #Calculate mortality rate difference (treatment effect) est
+  est.nex <- as.numeric(colMeans(pt_mcmc) - colMeans(pc_mcmc))
+  #Calculate mortality rate difference 95% credible interval
+  nex.diff     <- pt_mcmc - pc_mcmc
+  colnames(nex.diff) <- NULL
+  credible.nex <- apply(nex.diff, 2, function(column)quantile(column, c(0.025, 0.975)))
+  
+  
+  ## ----------------------------------------------------
+  ## EXNEX-2D
+  ## ----------------------------------------------------
+  pc_mcmc <- NULL
+  for (basket in 1:B) {
+    ## beta mixture priors
+    bm_prior <-
+      mixbeta(rob = c(0.5, 1, 1),
+              inf = c(0.5, infor_prior_ab[basket,]))
+    bm_post <-
+      postmix(priormix = bm_prior,
+              n = trial_summary$n_soc[basket],
+              r = trial_summary$y_soc[basket])
+    
+    pc_mcmc <- cbind(pc_mcmc, rmix(bm_post, 5000))
+  }
+  # Test Decision
+  nex.2D.pp <- colMeans(pt_mcmc < pc_mcmc + ni_mar)
+  decision.nex.2D <- nex.2D.pp > gam_nex2D
+  names(decision.nex.2D) <- NULL
+  #Calculate mortality rate difference (treatment effect) est
+  est.nex.2D <- as.numeric(colMeans(pt_mcmc) - colMeans(pc_mcmc))
+  #Calculate mortality rate difference 95% credible interval
+  nex.2D.diff     <- pt_mcmc - pc_mcmc
+  colnames(nex.2D.diff) <- NULL
+  credible.nex.2D <- apply(nex.2D.diff, 2, function(column) quantile(column, c(0.025, 0.975)))
+  
+  
+  # Test Decision Comparison
+  decision.comparison <- cbind(decision.pool, decision.test.pool, decision.ref,
+                               decision.bma, decision.nex,
+                               decision.bma.2D, decision.nex.2D)
+  decision.comparison <- as.data.frame(decision.comparison)
+  rownames(decision.comparison) <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                                     "Aspergillus", "Mucorales")
+  
+  # Test Decision Evidence Comparison
+  decision.evidence <- cbind(pvalue.pool, pvalue.test.pool, ref.pp,
+                             bma.pp, nex.pp,
+                             bma.2D.pp, nex.2D.pp)
+  decision.evidence <- round(decision.evidence, 4)
+  decision.evidence <- as.data.frame(decision.evidence)
+  rownames(decision.evidence) <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                                     "Aspergillus", "Mucorales")
+  
+  # Mortality Rate Difference (Treatment Effect) Est Comparison
+  est.comparison <- cbind(est.pool, est.test.pool, est.ref,
+                          est.bma, est.nex, est.bma.2D, est.nex.2D)
+  est.comparison <- as.data.frame(est.comparison)
+  rownames(est.comparison) <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                                "Aspergillus", "Mucorales")
+  
+  # Mortality Rate Difference 95% Confidence/Credible Interval Comparison
+  # Define a function to combine lower and upper limits into a string with parentheses, aligned with three significant digits
+  combine_ci_aligned <- function(lower, upper) {
+    lower_formatted <-
+      sprintf("%6.2f", lower)  # Remove leading space for the lower bound
+    upper_formatted <-
+      sprintf("%6.2f", upper)  # Remove leading space for the upper bound
+    return(paste0("(", lower_formatted, ", ", upper_formatted, ")"))
+  }
+  # Construct the data frame with aligned confidence intervals
+  ci.comparison <- data.frame(
+    Method1 = combine_ci_aligned(confidence.pool[1, ], confidence.pool[2, ]),
+    Method2 = combine_ci_aligned(confidence.test.pool[1, ], confidence.test.pool[2, ]),
+    Method3 = combine_ci_aligned(credible.ref[1, ], credible.ref[2, ]),
+    Method4 = combine_ci_aligned(credible.bma[1, ], credible.bma[2, ]),
+    Method5 = combine_ci_aligned(credible.nex[1, ], credible.nex[2, ]),
+    Method6 = combine_ci_aligned(credible.bma.2D[1, ], credible.bma.2D[2, ]),
+    Method7 = combine_ci_aligned(credible.nex.2D[1, ], credible.nex.2D[2, ])
+  )
+  # Set column names for the output data frame
+  colnames(ci.comparison) <- c("Pool", "Test&Pool", "Reference",
+                               "BMA", "EXNEX", "BMA-2D", "EXNEX-2D")
+  rownames(ci.comparison) <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                               "Aspergillus", "Mucorales")
+  
+  # Define a function to combine point estimate and confidence intervals into "point_estimate (lower, upper)" format
+  # Both point estimate and confidence interval are formatted to three significant digits
+  combine_point_ci <- function(point, ci) {
+    point_formatted <-
+      sprintf("%6.2f", point)  # Format point estimate to three significant digits
+    return(paste0(point_formatted, " ", ci))  # Combine point estimate and confidence interval with a space
+  }
+  
+  # Create a new data frame by combining point estimates and confidence intervals
+  combined.inf <- data.frame(
+    Method1 = mapply(combine_point_ci, est.comparison[, 1], ci.comparison[, 1]),
+    Method2 = mapply(combine_point_ci, est.comparison[, 2], ci.comparison[, 2]),
+    Method3 = mapply(combine_point_ci, est.comparison[, 3], ci.comparison[, 3]),
+    Method4 = mapply(combine_point_ci, est.comparison[, 4], ci.comparison[, 4]),
+    Method5 = mapply(combine_point_ci, est.comparison[, 5], ci.comparison[, 5]),
+    Method6 = mapply(combine_point_ci, est.comparison[, 6], ci.comparison[, 6]),
+    Method7 = mapply(combine_point_ci, est.comparison[, 7], ci.comparison[, 7])
+  )
+  
+  # Add row names (fungal names)
+  rownames(combined.inf) <- c("Fusarium", "Scedosporium", "Lomentospora", 
+                              "Aspergillus", "Mucorales")
+  # Add column names (comparison methods)
+  colnames(combined.inf) <- c("Pool", "Test&Pool", "Reference",
+                               "BMA", "EXNEX", "BMA-2D", "EXNEX-2D")
+  
+  # Combine the results in a list
+  case <- list(decision   = decision.comparison,
+               evidence   = decision.evidence,
+               estimate   = est.comparison,
+               confidence = ci.comparison,
+               inference  = combined.inf)
+  return(case)
+}
+```
+
+
+```{r}
+## Generate case study data
+set.seed(3)
+## ----------------------------------------------------------------
+s <- 4
+sim_out <- sim.dat(n_soc = n_soc, n_trt = n_trt, 
+                   p_soc = pmat0[s, ] + ni_mar, p_trt = pmat1[s, ])
+trial_dat <- sim_out$raw_data
+## ----------------------------------------------------------------
+set.seed(NULL)
+sim_out$summary_data
+D42.Death.treatment <- sim_out$summary_data$y_trt/sim_out$summary_data$n_trt
+D42.Death.control   <- sim_out$summary_data$y_soc/sim_out$summary_data$n_soc
+D42.Death.differ    <- round(D42.Death.treatment - D42.Death.control, 2)
+D42.Death.differ
+
+Case.Study(trial_dat)
+## Explanation: bma.2D.pp is close to gam_bma2D, so sometimes 3 TRUE, 
+## sometimes 2 TRUE.
+```
+
+
+```{r}
+## Generate case study data
+set.seed(21)
+## ----------------------------------------------------------------
+s <- 6
+sim_out <- sim.dat(n_soc = n_soc, n_trt = n_trt, 
+                   p_soc = pmat0[s, ] + ni_mar, p_trt = pmat1[s, ])
+trial_dat <- sim_out$raw_data
+## ----------------------------------------------------------------
+set.seed(NULL)
+sim_out$summary_data
+D42.Death.treatment <- sim_out$summary_data$y_trt/sim_out$summary_data$n_trt
+D42.Death.control   <- sim_out$summary_data$y_soc/sim_out$summary_data$n_soc
+D42.Death.differ    <- round(D42.Death.treatment - D42.Death.control, 2)
+D42.Death.differ
+
+Case.Study(trial_dat)
+## Explanation: bma.2D.pp is close to gam_bma2D, so sometimes 5 TRUE, 
+## sometimes 4 TRUE.
+```
+
+
+
