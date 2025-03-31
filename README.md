@@ -20,7 +20,9 @@ Invasive mould infections (IMIs) are rare but life-threatening. Regulatory appro
 
 --trial simulations.R: scripts of running simulations  
 
---figures.R: scripts for having plots for simulation and sensitivity analysis
+--figures.R: scripts for having plots for simulation and sensitivity analysis  
+
+--Re_Analysis of IMI Trial.Rmd: scripts for re_analysis of IMI trial used in Case Study
 
 
 
