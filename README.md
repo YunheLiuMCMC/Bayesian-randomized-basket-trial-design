@@ -10,11 +10,33 @@ Invasive mould infections (IMIs) are rare but life-threatening. Regulatory appro
 # Code Overview
 
 ### Paper.code:
---reg_bma.R/myfun.R/mem functions.R: scripts for implmenting BMA and BMA-2D methods  
+-- reg_bma.R / myfun.R / mem functions.R:
+     Core functions for implementing the proposed BMA and BMA-2D methods.
+     These scripts are sourced by the trial simulation workflow and by re-analysis of the invasive mould infection trial.
 
---exnex.R/exnex utility.R: scripts for implementing EXNEX and EXNEX-2D methods  
+-- exnex.R / exnex utility.R:
+     Functions for implementing the EXNEX and EXNEX-2D borrowing approaches.
+     exnex.R requires exnex utility.R and is sourced during simulation
+     and model fitting for competing methods.
 
---Re_Analysis of IMI Trial.Rmd: scripts for re_analysis of IMI trial used in Case Study
+-- trial of Invasive mould infections.R:
+     Generates the simulation datasets used in the manuscript.
+     This script sources:
+         source("reg_bma.R")
+         source("myfun.R")
+         source("mem functions.R")
+         source("exnex.R")     # which itself uses exnex utility.R
+
+-- trial simulations.R:
+     Fits the proposed methods (BMA / BMA-2D) and competing methods to the simulated datasets generated above.
+
+-- figures.R:
+     Produces numerical summaries and figures based on the model-fitting results from trial simulations (e.g., FWER, power, and bias comparisons).
+
+-- Re_Analysis of IMI Trial.Rmd:
+     Script for reproducing the case-study analysis of the invasive mould infection (IMI) trial using the summary-level external control data and simulated datasets.
+
+
 
 
 
